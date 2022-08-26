@@ -1,4 +1,4 @@
-// itlib-small-vector v1.04
+// itlib-small-vector v1.05
 //
 // std::vector-like class with a static buffer for initial capacity
 //
@@ -29,6 +29,9 @@
 //
 //                  VERSION HISTORY
 //
+//  1.05 (2022-08-26) Redesign
+//                    * Smaller size
+//                    * Inherit from allocator to make use of EBO
 //  1.04 (2022-04-14) Noxcept move construct and assign
 //  1.03 (2021-10-05) Use allocator member instead of inheriting from allocator
 //                    Allow compare with small_vector of different static_size
@@ -210,8 +213,6 @@ public:
     small_vector(const Alloc& alloc)
         : Alloc(alloc)
         , m_capacity(StaticCapacity)
-        , m_dynamic_capacity(0)
-        , m_dynamic_data(nullptr)
     {
         m_begin = m_end = static_begin_ptr();
     }
@@ -225,20 +226,20 @@ public:
     explicit small_vector(size_t count, const T& value, const Alloc& alloc = Alloc())
         : small_vector(alloc)
     {
-        assign_impl(count, value);
+        assign_fill(count, value);
     }
 
     template <class InputIterator, typename = decltype(*std::declval<InputIterator>())>
     small_vector(InputIterator first, InputIterator last, const Alloc& alloc = Alloc())
         : small_vector(alloc)
     {
-        assign_impl(first, last);
+        assign_copy(first, last);
     }
 
     small_vector(std::initializer_list<T> l, const Alloc& alloc = Alloc())
         : small_vector(alloc)
     {
-        assign_impl(l);
+        assign_move(l.begin(), l.end());
     }
 
     small_vector(const small_vector& v)
@@ -247,64 +248,24 @@ public:
 
     small_vector(const small_vector& v, const Alloc& alloc)
         : Alloc(alloc)
-        , m_dynamic_capacity(0)
-        , m_dynamic_data(nullptr)
     {
-        if (v.size() > StaticCapacity)
-        {
-            m_dynamic_capacity = v.size();
-            m_begin = m_end = m_dynamic_data = atraits::allocate(get_alloc(), m_dynamic_capacity);
-            m_capacity = v.size();
-        }
-        else
-        {
-            m_begin = m_end = static_begin_ptr();
-            m_capacity = StaticCapacity;
-        }
-
-        for (auto p = v.m_begin; p != v.m_end; ++p)
-        {
-            atraits::construct(get_alloc(), m_end, *p);
-            ++m_end;
-        }
+        assing_copy(v.begin(), v.end());
     }
 
     small_vector(small_vector&& v) noexcept
         : Alloc(std::move(v.get_alloc()))
         , m_capacity(v.m_capacity)
-        , m_dynamic_capacity(v.m_dynamic_capacity)
-        , m_dynamic_data(v.m_dynamic_data)
     {
-        if (v.m_begin == v.static_begin_ptr())
-        {
-            m_begin = m_end = static_begin_ptr();
-            for (auto p = v.m_begin; p != v.m_end; ++p)
-            {
-                atraits::construct(get_alloc(), m_end, std::move(*p));
-                ++m_end;
-            }
-
-            v.clear();
-        }
-        else
-        {
-            m_begin = v.m_begin;
-            m_end = v.m_end;
-        }
-
-        v.m_dynamic_capacity = 0;
-        v.m_dynamic_data = nullptr;
-        v.m_begin = v.m_end = v.static_begin_ptr();
-        v.m_capacity = StaticCapacity;
+        take_impl(v);
     }
 
     ~small_vector()
     {
-        clear();
+        destroy_all();
 
-        if (m_dynamic_data)
+        if (!is_static())
         {
-            atraits::deallocate(get_alloc(), m_dynamic_data, m_dynamic_capacity);
+            atraits::deallocate(get_alloc(), m_begin, m_capacity);
         }
     }
 
@@ -316,72 +277,51 @@ public:
             return *this;
         }
 
-        clear();
-
-        m_begin = m_end = choose_data(v.size());
-
-        for (auto p = v.m_begin; p != v.m_end; ++p)
-        {
-            atraits::construct(get_alloc(), m_end, *p);
-            ++m_end;
-        }
-
-        update_capacity();
+        destroy_all();
+        assign_copy(v.begin(), v.end());
 
         return *this;
     }
 
     small_vector& operator=(small_vector&& v) noexcept
     {
-        clear();
+        if (this == &v)
+        {
+            // prevent self usurp
+            return *this;
+        }
+
+        destroy_all();
+        if (!is_static())
+        {
+            atraits::deallocate(get_alloc(), m_begin, m_capacity);
+        }
 
         get_alloc() = std::move(v.get_alloc());
         m_capacity = v.m_capacity;
-        m_dynamic_capacity = v.m_dynamic_capacity;
-        m_dynamic_data = v.m_dynamic_data;
 
-        if (v.m_begin == v.static_begin_ptr())
-        {
-            m_begin = m_end = static_begin_ptr();
-            for (auto p = v.m_begin; p != v.m_end; ++p)
-            {
-                atraits::construct(get_alloc(), m_end, std::move(*p));
-                ++m_end;
-            }
-
-            v.clear();
-        }
-        else
-        {
-            m_begin = v.m_begin;
-            m_end = v.m_end;
-        }
-
-        v.m_dynamic_capacity = 0;
-        v.m_dynamic_data = nullptr;
-        v.m_begin = v.m_end = v.static_begin_ptr();
-        v.m_capacity = StaticCapacity;
+        take_impl(v);
 
         return *this;
     }
 
     void assign(size_type count, const T& value)
     {
-        clear();
-        assign_impl(count, value);
+        destroy_all();
+        assign_fill(count, value);
     }
 
     template <class InputIterator, typename = decltype(*std::declval<InputIterator>())>
     void assign(InputIterator first, InputIterator last)
     {
-        clear();
-        assign_impl(first, last);
+        destroy_all();
+        assign_copy(first, last);
     }
 
     void assign(std::initializer_list<T> ilist)
     {
-        clear();
-        assign_impl(ilist);
+        destroy_all();
+        assign_move(ilist.begin(), ilist.end());
     }
 
     allocator_type get_allocator() const
@@ -522,22 +462,17 @@ public:
     {
         if (new_cap <= m_capacity) return;
 
-        auto new_buf = choose_data(new_cap);
+        auto cdr = choose_data(new_cap);
 
-        assert(new_buf != m_begin); // should've been handled by new_cap <= m_capacity
-        assert(new_buf != static_begin_ptr()); // we should never reserve into static memory
+        assert(cdr.ptr != m_begin); // should've been handled by new_cap <= m_capacity
+        assert(cdr.ptr != static_begin_ptr()); // we should never reserve into static memory
 
-        const auto s = size();
-        if(s < RevertToStaticSize)
-        {
-            // we've allocated enough memory for the dynamic buffer but don't move there until we have to
-            return;
-        }
+        auto s = size();
 
         // now we need to transfer the existing elements into the new buffer
         for (size_type i = 0; i < s; ++i)
         {
-            atraits::construct(get_alloc(), new_buf + i, std::move(*(m_begin + i)));
+            atraits::construct(get_alloc(), cdr.ptr + i, std::move(*(m_begin + i)));
         }
 
         // free old elements
@@ -546,15 +481,15 @@ public:
             atraits::destroy(get_alloc(), m_begin + i);
         }
 
-        if (m_begin != static_begin_ptr())
+        if (!is_static())
         {
             // we've moved from dyn to dyn memory, so deallocate the old one
             atraits::deallocate(get_alloc(), m_begin, m_capacity);
         }
 
-        m_begin = new_buf;
-        m_end = new_buf + s;
-        m_capacity = m_dynamic_capacity;
+        m_begin = cdr.ptr;
+        m_end = m_begin + s;
+        m_capacity = ctr.cap;
     }
 
     size_t capacity() const noexcept
@@ -566,10 +501,12 @@ public:
     {
         const auto s = size();
 
-        if (s == m_capacity) return;
-        if (m_begin == static_begin_ptr()) return;
+        if (s == m_capacity) return; // we're at max
+        if (is_static()) return; // can't shrink static buf
 
+        auto old_begin = m_begin;
         auto old_end = m_end;
+        auto old_cap = m_capacity;
 
         if (s < StaticCapacity)
         {
@@ -584,46 +521,37 @@ public:
             m_capacity = s;
         }
 
-        for (auto p = m_dynamic_data; p != old_end; ++p)
+        for (auto p = old_begin; p != old_end; ++p)
         {
             atraits::construct(get_alloc(), m_end, std::move(*p));
             ++m_end;
             atraits::destroy(get_alloc(), p);
         }
 
-        atraits::deallocate(get_alloc(), m_dynamic_data, m_dynamic_capacity);
-        m_dynamic_data = nullptr;
-        m_dynamic_capacity = 0;
+        atraits::deallocate(get_alloc(), old_begin, old_cap);
     }
 
-    void revert_to_static()
+    // only revert if possible
+    // otherwise don't shrink
+    // return true if reverted
+    bool revert_to_static()
     {
         const auto s = size();
-        if (m_begin == static_begin_ptr()) return; //we're already there
-        if (s > StaticCapacity) return; // nothing we can do
+        if (is_static()) return true; //we're already there
+        if (s > StaticCapacity) return false; // nothing we can do
 
-        // revert to static capacity
-        auto old_end = m_end;
-        m_begin = m_end = static_begin_ptr();
-        m_capacity = StaticCapacity;
-        for (auto p = m_dynamic_data; p != old_end; ++p)
-        {
-            atraits::construct(get_alloc(), m_end, std::move(*p));
-            ++m_end;
-            atraits::destroy(get_alloc(), p);
-        }
+        shrink_to_fit();
+        return true;
     }
 
     // modifiers
     void clear() noexcept
     {
-        for (auto p = m_begin; p != m_end; ++p)
-        {
-            atraits::destroy(get_alloc(), p);
-        }
+        destroy_all();
 
-        if (RevertToStaticSize > 0)
+        if (RevertToStaticSize > 0 && !is_static())
         {
+            atraits::deallocate(get_alloc(), m_begin, m_capacity);
             m_begin = m_end = static_begin_ptr();
             m_capacity = StaticCapacity;
         }
@@ -633,6 +561,8 @@ public:
         }
     }
 
+    /////////////////////////
+    // TODO:
     iterator insert(const_iterator position, const value_type& val)
     {
         auto pos = grow_at(position, 1);
@@ -852,10 +782,46 @@ public:
         }
     }
 
+    bool is_static() const
+    {
+        return m_begin == static_begin_ptr();
+    }
+
 private:
     T* static_begin_ptr()
     {
         return reinterpret_cast<pointer>(m_static_data + 0);
+    }
+
+    void destroy_all()
+    {
+        for (auto p = m_begin; p != m_end; ++p)
+        {
+            atraits::destroy(get_alloc(), p);
+        }
+    }
+
+    void take_impl(small_vector& v)
+    {
+        if (v.is_static())
+        {
+            m_begin = m_end = static_begin_ptr();
+            for (auto p = v.m_begin; p != v.m_end; ++p)
+            {
+                atraits::construct(get_alloc(), m_end, std::move(*p));
+                ++m_end;
+            }
+
+            v.destroy_all();
+        }
+        else
+        {
+            m_begin = v.m_begin;
+            m_end = v.m_end;
+        }
+
+        v.m_begin = v.m_end = v.static_begin_ptr();
+        v.m_capacity = StaticCapacity;
     }
 
     // increase the size by splicing the elements in such a way that
@@ -991,62 +957,66 @@ private:
         return position;
     }
 
-    void assign_impl(size_type count, const T& value)
+    void assign_fill(size_type count, const T& value)
     {
-        assert(m_begin);
-        assert(m_begin == m_end);
+        auto cdr = choose_data(v.size());
 
-        m_begin = m_end = choose_data(count);
-        for (size_type i = 0; i < count; ++i)
+        m_end = cdr.ptr;
+        for (size_t i=0; i<count; ++i)
         {
             atraits::construct(get_alloc(), m_end, value);
             ++m_end;
         }
 
-        update_capacity();
+        if (!is_static() && m_begin != cdr.p)
+        {
+            atraits::deallocate(get_alloc(), m_begin, m_capacity);
+            m_begin = cdr.p;
+        }
+
+        m_capacity = cdr.cap;
     }
 
     template <class InputIterator>
-    void assign_impl(InputIterator first, InputIterator last)
+    void assign_copy(InputIterator first, InputIterator last)
     {
-        assert(m_begin);
-        assert(m_begin == m_end);
+        auto cdr = choose_data(v.size());
 
-        m_begin = m_end = choose_data(last - first);
+        m_end = cdr.ptr;
         for (auto p = first; p != last; ++p)
         {
             atraits::construct(get_alloc(), m_end, *p);
             ++m_end;
         }
 
-        update_capacity();
+        if (!is_static() && m_begin != cdr.p)
+        {
+            atraits::deallocate(get_alloc(), m_begin, m_capacity);
+            m_begin = cdr.p;
+        }
+
+        m_capacity = cdr.cap;
     }
 
-    void assign_impl(std::initializer_list<T> ilist)
+    template <class InputIterator>
+    void assign_move(InputIterator first, InputIterator last)
     {
-        assert(m_begin);
-        assert(m_begin == m_end);
+        auto cdr = choose_data(v.size());
 
-        m_begin = m_end = choose_data(ilist.size());
-        for (auto& elem : ilist)
+        m_end = cdr.ptr;
+        for (auto p = first; p != last; ++p)
         {
-            atraits::construct(get_alloc(), m_end, elem);
+            atraits::construct(get_alloc(), m_end, std::move(*p));
             ++m_end;
         }
 
-        update_capacity();
-    }
+        if (!is_static() && m_begin != cdr.p)
+        {
+            atraits::deallocate(get_alloc(), m_begin, m_capacity);
+            m_begin = cdr.p;
+        }
 
-    void update_capacity()
-    {
-        if (m_begin == static_begin_ptr())
-        {
-            m_capacity = StaticCapacity;
-        }
-        else
-        {
-            m_capacity = m_dynamic_capacity;
-        }
+        m_capacity = cdr.cap;
     }
 
     T* choose_data(size_t desired_capacity)
@@ -1114,14 +1084,10 @@ private:
     allocator_type& get_alloc() { return *this; }
     const allocator_type& get_alloc() const { return *this; }
 
-    pointer m_begin;
+    pointer m_begin; // begin either points to m_static_data or to new memory
     pointer m_end;
-
     size_t m_capacity;
     typename std::aligned_storage<sizeof(T), std::alignment_of<T>::value>::type m_static_data[StaticCapacity];
-
-    size_t m_dynamic_capacity;
-    pointer m_dynamic_data;
 };
 
 template<typename T,
